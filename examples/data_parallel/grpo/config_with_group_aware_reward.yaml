@@ -1,0 +1,134 @@
+# Example GRPO configuration using GroupAwareRewardManager for adaptive reward scoring
+#
+# This configuration demonstrates how to use group-aware reward scoring where the reward
+# function can see all responses generated for the same prompt and compute adaptive rewards.
+#
+# Usage:
+#   python -m verl.trainer.main_ppo \
+#       --config-path examples/data_parallel/grpo \
+#       --config-name config_with_group_aware_reward
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+data:
+  max_prompt_length: 1024
+  max_response_length: 1024
+  train_batch_size: 256
+  reward_fn_key: data_source  # Key to access data source in batch
+
+# ============================================================================
+# GRPO Algorithm Configuration
+# ============================================================================
+algorithm:
+  adv_estimator: grpo  # Use GRPO advantage estimation
+  gamma: 1.0
+  lam: 1.0
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.001
+  norm_adv_by_std_in_grpo: true  # Set to false for Dr.GRPO variant
+
+# ============================================================================
+# Actor Rollout Configuration
+# ============================================================================
+actor_rollout_ref:
+  rollout:
+    # IMPORTANT: Number of responses to generate per prompt
+    # For GRPO, this should be > 1 (typically 4-16)
+    # All these responses will be visible to your reward function
+    n: 8
+
+    # Other rollout parameters
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+
+  actor:
+    # Use KL loss instead of KL penalty in reward (recommended for GRPO)
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+
+    # PPO-specific parameters
+    ppo_mini_batch_size: 64
+    ppo_micro_batch_size: 16
+    ppo_epochs: 1
+    entropy_coeff: 0.0
+
+# ============================================================================
+# Reward Model Configuration - Using GroupAwareRewardManager
+# ============================================================================
+reward_model:
+  # IMPORTANT: Set reward_manager to "group_aware"
+  reward_manager: group_aware
+
+  # Number of groups to print for debugging (set to 0 in production)
+  num_examine: 5
+
+  # Optional: Additional reward kwargs passed to the reward manager
+  reward_kwargs: {}
+
+# ============================================================================
+# Custom Reward Function Configuration
+# ============================================================================
+custom_reward_function:
+  # REQUIRED: Path to your custom reward function Python file
+  # This file should contain your group-aware reward function
+  path: examples/data_parallel/grpo/group_aware_reward_examples.py
+
+  # REQUIRED: Name of the reward function to use
+  # Options from group_aware_reward_examples.py:
+  #   - simple_group_aware_reward: Basic example
+  #   - adaptive_difficulty_reward: Adjust based on group success rate
+  #   - relative_quality_reward: Normalize by group statistics
+  #   - best_of_n_reward: Winner-takes-all
+  #   - pass_at_k_reward: Pass@k style rewards
+  name: adaptive_difficulty_reward
+
+  # OPTIONAL: Additional keyword arguments passed to your reward function
+  # These will be merged with the standard arguments (prompt_str, responses, etc.)
+  reward_kwargs:
+    # Example custom parameters (adjust based on your reward function)
+    # k: 1  # For pass_at_k_reward
+    # diversity_weight: 0.1  # For diversity-aware rewards
+    # min_quality_threshold: 0.5  # For quality filtering
+
+# ============================================================================
+# Training Configuration
+# ============================================================================
+trainer:
+  total_epochs: 10
+
+  # Logging
+  logger:
+    - tensorboard
+    - wandb  # Optional, remove if not using wandb
+
+  # Checkpointing
+  save_freq: 1  # Save every N epochs
+  project_name: grpo_adaptive_reward
+  experiment_name: grpo_${data.train_batch_size}_n${actor_rollout_ref.rollout.n}
+
+# ============================================================================
+# Critic Configuration
+# ============================================================================
+# GRPO is critic-less, so we disable the critic
+critic: null
+
+# ============================================================================
+# Notes and Best Practices
+# ============================================================================
+# 1. Ensure actor_rollout_ref.rollout.n > 1 for GRPO (multiple responses per prompt)
+# 2. Your reward function must return a list of scores matching the number of responses
+# 3. Use num_examine to debug your reward function during development
+# 4. Consider the trade-off between reward quality and computation time
+# 5. Test your reward function independently before using in training
+# 6. Monitor group statistics in your reward function outputs
