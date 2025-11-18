@@ -1,0 +1,196 @@
+# Example GRPO configuration using GroupAwareRewardManager for proactive agent training
+#
+# This configuration demonstrates how to use group-aware reward scoring where the reward
+# function can see all responses generated for the same prompt and compute adaptive rewards.
+#
+# Usage:
+#   bash examples/proactive/run_pro_grpo.sh
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+data:
+  tokenizer: null  # Will be set from model
+  # TODO: Update these paths to your actual data location
+  train_files: ~/data/proactive_dataset/train.parquet
+  val_files: ~/data/proactive_dataset/test.parquet  # Optional: create if you have validation data
+  train_max_samples: -1  # -1 to use full dataset
+  val_max_samples: -1
+  prompt_key: prompt
+  max_prompt_length: 1024
+  max_response_length: 1024
+  train_batch_size: 256  # Adjust based on your GPU memory
+  return_raw_input_ids: false
+  return_raw_chat: true  # Set to true for chat models
+  return_full_prompt: false
+  shuffle: true
+  seed: 42
+  reward_fn_key: data_source  # Key to access data source in batch
+
+# ============================================================================
+# GRPO Algorithm Configuration
+# ============================================================================
+algorithm:
+  adv_estimator: grpo  # Use GRPO advantage estimation
+  gamma: 1.0
+  lam: 1.0
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.001
+  norm_adv_by_std_in_grpo: true  # Set to false for Dr.GRPO variant
+
+# ============================================================================
+# Actor Rollout Configuration
+# ============================================================================
+actor_rollout_ref:
+  hybrid_engine: true
+
+  model:
+    # TODO: Update to your model path
+    path: ~/models/your-model-name  # e.g., Qwen/Qwen2.5-7B-Instruct
+    external_lib: null
+    override_config: {}
+    enable_gradient_checkpointing: true
+    use_remove_padding: false
+
+  rollout:
+    # IMPORTANT: Number of responses to generate per prompt
+    # For GRPO, this should be > 1 (typically 4-16)
+    # All these responses will be visible to your reward function
+    n: 16
+
+    # Rollout engine configuration
+    name: vllm  # or sglang
+    gpu_memory_utilization: 0.4  # Adjust based on your setup
+
+    # Generation parameters
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+
+    tensor_model_parallel_size: 1
+    load_format: auto
+
+  actor:
+    strategy: fsdp
+
+    # Use KL loss instead of KL penalty in reward (recommended for GRPO)
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+
+    # PPO-specific parameters
+    ppo_mini_batch_size: 64
+    ppo_micro_batch_size_per_gpu: 16  # Adjust based on GPU memory
+    ppo_epochs: 1
+    ppo_max_token_len_per_gpu: 16384  # Max tokens per GPU for training
+
+    grad_clip: 1.0
+    clip_ratio: 0.2
+    entropy_coeff: 0.0
+
+    optim:
+      lr: 1e-6
+      min_lr: 1e-7
+      weight_decay: 0.0
+
+# ============================================================================
+# Reward Model Configuration - Using GroupAwareRewardManager
+# ============================================================================
+reward_model:
+  # IMPORTANT: Set reward_manager to "group_aware"
+  reward_manager: group_aware
+
+  # Number of groups to print for debugging (set to 0 in production)
+  num_examine: 5
+
+  # Optional: Additional reward kwargs passed to the reward manager
+  reward_kwargs: {}
+
+# ============================================================================
+# Custom Reward Function Configuration
+# ============================================================================
+custom_reward_function:
+  # REQUIRED: Path to your custom reward function Python file
+  # This file should contain your group-aware reward function
+  path: examples/proactive/group_aware_reward.py
+
+  # REQUIRED: Name of the reward function to use
+  # Options:
+  #   - proactive_group_aware_reward: Main function with proactive scoring
+  #   - proactive_group_aware_reward_detailed: Returns detailed metrics
+  #   - simple_group_aware_reward: Basic example
+  #   - adaptive_difficulty_reward: Adjust based on group success rate
+  name: proactive_group_aware_reward
+
+  # OPTIONAL: Additional keyword arguments passed to your reward function
+  # These will be merged with the standard arguments (prompt_str, responses, etc.)
+  reward_kwargs:
+    beta: 0.5  # Weight for proactive scoring (0.0 to 1.0)
+    # think_bonus: 0.05  # Bonus for using <think> tags (optional, has default)
+    # proactive_bonus: 0.05  # Bonus for using <proactive> tags (optional, has default)
+
+# ============================================================================
+# Training Configuration
+# ============================================================================
+trainer:
+  total_epochs: 10
+  total_training_steps: null  # Set this if you want to train for a specific number of steps
+
+  # Logging
+  logger:
+    - console
+    - tensorboard
+    # - wandb  # Uncomment if using wandb
+
+  log_val_generations: 5  # Number of validation generations to log
+
+  # Distributed training - 4 GPUs configuration
+  nnodes: 1  # Single node
+  n_gpus_per_node: 4  # 4 GPUs
+
+  # Checkpointing
+  save_freq: 1  # Save every N epochs
+  resume_mode: auto  # auto: find last checkpoint to resume
+  resume_from_path: null
+
+  # Testing/Validation
+  test_freq: -1  # -1 to disable, or set to N to test every N epochs
+
+  # Directories
+  project_name: proactive_agent
+  experiment_name: grpo_beta${custom_reward_function.reward_kwargs.beta}_n${actor_rollout_ref.rollout.n}
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  default_hdfs_dir: null
+
+# ============================================================================
+# Critic Configuration
+# ============================================================================
+# GRPO is critic-less, so we disable the critic
+critic: null
+
+# ============================================================================
+# Ray Configuration
+# ============================================================================
+ray_kwargs:
+  ray_init:
+    num_cpus: null  # None means using all CPUs
+
+# ============================================================================
+# Notes and Best Practices
+# ============================================================================
+# 1. Ensure actor_rollout_ref.rollout.n > 1 for GRPO (multiple responses per prompt)
+# 2. Your reward function must return a list of scores matching the number of responses
+# 3. Use num_examine to debug your reward function during development
+# 4. Consider the trade-off between reward quality and computation time
+# 5. Test your reward function independently before using in training
+# 6. Monitor group statistics in your reward function outputs
+# 7. Adjust batch sizes based on your 4-GPU memory capacity
+# 8. The experiment name includes beta and n for easy tracking
