@@ -1,13 +1,15 @@
 #!/bin/bash
 # Run proactive agent GRPO training with group-aware rewards on 4 GPUs
 #
+# This script will:
+# 1. Automatically process sampleQA.jsonl data if not already processed
+# 2. Run GRPO training with group-aware rewards
+#
 # Usage:
 #   bash examples/proactive/run_pro_grpo.sh
 #
-# Make sure to:
-# 1. Update the data paths in config_with_group_aware_reward.yaml
-# 2. Update the model path in config_with_group_aware_reward.yaml
-# 3. Convert your JSONL data using convert_data.py first
+# Or with custom arguments:
+#   bash examples/proactive/run_pro_grpo.sh ++custom_reward_function.reward_kwargs.beta=0.7
 
 set -e  # Exit on error
 
@@ -21,34 +23,72 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3
 # Python path
 PYTHON_EXEC=${PYTHON_EXEC:-python}
 
+# Paths
+INPUT_DATA="data/sampleQA.jsonl"
+OUTPUT_DATA_DIR="data/processed_sampleQA"
+TRAIN_DATA="${OUTPUT_DATA_DIR}/train.parquet"
+TEST_DATA="${OUTPUT_DATA_DIR}/test.parquet"
+
 # Config path
 CONFIG_PATH="examples/proactive"
 CONFIG_NAME="config_with_group_aware_reward"
 
 # ============================================================================
-# Optional: Override config values via command line
+# Step 1: Process data if needed
 # ============================================================================
 
-# You can override any config value by passing it as an argument
-# For example:
-#   bash run_pro_grpo.sh ++custom_reward_function.reward_kwargs.beta=0.7
+echo "============================================================================"
+echo "Checking data status..."
+echo "============================================================================"
+
+if [ -f "${TRAIN_DATA}" ] && [ -f "${TEST_DATA}" ]; then
+    echo "✓ Processed data found:"
+    echo "  - ${TRAIN_DATA}"
+    echo "  - ${TEST_DATA}"
+    echo ""
+else
+    echo "✗ Processed data not found. Processing sampleQA.jsonl..."
+    echo ""
+
+    # Check if input data exists
+    if [ ! -f "${INPUT_DATA}" ]; then
+        echo "Error: Input data file not found: ${INPUT_DATA}"
+        echo ""
+        echo "Please ensure that sampleQA.jsonl exists in the data/ directory."
+        echo "Expected format:"
+        echo '{"id": 0, "messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}], ...}'
+        exit 1
+    fi
+
+    echo "Processing data from ${INPUT_DATA}..."
+    $PYTHON_EXEC examples/proactive/process_sampleQA.py \
+        --input_file "${INPUT_DATA}" \
+        --output_dir "${OUTPUT_DATA_DIR}" \
+        --system_prompt "You are a helpful proactive assistant." \
+        --split_ratio 0.95
+
+    echo ""
+    echo "✓ Data processing completed!"
+    echo ""
+fi
 
 # ============================================================================
-# Data Conversion (if needed)
+# Step 2: Verify processed data
 # ============================================================================
 
-# Uncomment and modify if you need to convert your JSONL data first:
-# echo "Converting JSONL data to veRL format..."
-# $PYTHON_EXEC examples/proactive/convert_data.py \
-#     --input_file /path/to/your/data.jsonl \
-#     --output_dir ~/data/proactive_dataset \
-#     --data_source_name proactive_dataset \
-#     --ability reasoning \
-#     --question_field question \
-#     --answer_field answer
+if [ ! -f "${TRAIN_DATA}" ]; then
+    echo "Error: Training data not found at ${TRAIN_DATA}"
+    echo "Data processing may have failed."
+    exit 1
+fi
+
+if [ ! -f "${TEST_DATA}" ]; then
+    echo "Warning: Test data not found at ${TEST_DATA}"
+    echo "Training will proceed but validation may not work."
+fi
 
 # ============================================================================
-# Run Training
+# Step 3: Run Training
 # ============================================================================
 
 echo "============================================================================"
@@ -56,13 +96,17 @@ echo "Starting Proactive Agent GRPO Training"
 echo "============================================================================"
 echo "Config: ${CONFIG_PATH}/${CONFIG_NAME}.yaml"
 echo "GPUs: ${CUDA_VISIBLE_DEVICES}"
+echo "Train data: ${TRAIN_DATA}"
+echo "Test data: ${TEST_DATA}"
 echo "============================================================================"
+echo ""
 
 $PYTHON_EXEC -m verl.trainer.main_ppo \
     --config-path ${CONFIG_PATH} \
     --config-name ${CONFIG_NAME} \
     "$@"  # Pass any additional arguments to the script
 
+echo ""
 echo "============================================================================"
 echo "Training completed!"
 echo "============================================================================"
@@ -72,30 +116,28 @@ echo "==========================================================================
 # ============================================================================
 #
 # Override beta value:
-#   bash run_pro_grpo.sh ++custom_reward_function.reward_kwargs.beta=0.7
+#   bash examples/proactive/run_pro_grpo.sh ++custom_reward_function.reward_kwargs.beta=0.7
 #
 # Override number of rollouts per prompt:
-#   bash run_pro_grpo.sh ++actor_rollout_ref.rollout.n=8
+#   bash examples/proactive/run_pro_grpo.sh ++actor_rollout_ref.rollout.n=8
 #
 # Override model path:
-#   bash run_pro_grpo.sh ++actor_rollout_ref.model.path=/path/to/model
-#
-# Override data path:
-#   bash run_pro_grpo.sh ++data.train_files=/path/to/train.parquet
+#   bash examples/proactive/run_pro_grpo.sh ++actor_rollout_ref.model.path=/path/to/model
 #
 # Change batch size:
-#   bash run_pro_grpo.sh ++data.train_batch_size=128
+#   bash examples/proactive/run_pro_grpo.sh ++data.train_batch_size=128
 #
 # Change number of epochs:
-#   bash run_pro_grpo.sh ++trainer.total_epochs=20
-#
-# Disable wandb logging:
-#   bash run_pro_grpo.sh trainer.logger='[console, tensorboard]'
+#   bash examples/proactive/run_pro_grpo.sh ++trainer.total_epochs=20
 #
 # Change experiment name:
-#   bash run_pro_grpo.sh ++trainer.experiment_name=my_experiment
+#   bash examples/proactive/run_pro_grpo.sh ++trainer.experiment_name=my_experiment
 #
 # Use different reward function:
-#   bash run_pro_grpo.sh ++custom_reward_function.name=proactive_group_aware_reward_detailed
+#   bash examples/proactive/run_pro_grpo.sh ++custom_reward_function.name=proactive_group_aware_reward_detailed
+#
+# Skip data processing (if you want to reprocess):
+#   rm -rf data/processed_sampleQA
+#   bash examples/proactive/run_pro_grpo.sh
 #
 # ============================================================================

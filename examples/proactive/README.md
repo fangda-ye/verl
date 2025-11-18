@@ -48,13 +48,52 @@ Proactive agent 是一种能够主动思考和推理的智能体，其回答分�
 ```
 examples/proactive/
 ├── README.md                           # 本文档
-├── convert_data.py                     # 数据转换脚本
+├── process_sampleQA.py                # sampleQA 数据处理脚本
+├── convert_data.py                     # 通用数据转换脚本
 ├── group_aware_reward.py              # 奖励函数实现
 ├── config_with_group_aware_reward.yaml # 训练配置（4 GPU）
-└── run_pro_grpo.sh                    # 训练脚本
+└── run_pro_grpo.sh                    # 训练脚本（自动处理数据）
 ```
 
-## 快速开始
+## 快速开始（使用 sampleQA 数据）
+
+**最简单的方式 - 一键启动**：
+
+1. 确保 `data/sampleQA.jsonl` 存在
+2. 运行：
+   ```bash
+   bash examples/proactive/run_pro_grpo.sh
+   ```
+
+脚本会自动：
+- 检查数据是否已处理
+- 如果未处理，自动运行 `process_sampleQA.py` 转换数据
+- 启动 GRPO 训练
+
+**数据格式说明**：
+
+`data/sampleQA.jsonl` 的每一行应该是：
+
+```json
+{
+  "id": 0,
+  "messages": [
+    {"role": "user", "content": "Who received the IEEE Frank Rosenblatt Award in 2010?"},
+    {"role": "assistant", "content": "Michio Sugeno"}
+  ],
+  "answer": {...},
+  "sub_category": "simpleQA"
+}
+```
+
+处理脚本会：
+- 提取 `messages[0]` (user) 作为 prompt
+- 提取 `messages[1]` (assistant) 作为 ground truth
+- 添加系统提示词："You are a helpful proactive assistant."
+- 自动分割为 train/test (95%/5%)
+- 保存到 `data/processed_sampleQA/`
+
+## 快速开始（使用自定义数据）
 
 ### 步骤 1：准备数据
 

@@ -19,9 +19,9 @@ defaults:
 # ============================================================================
 data:
   tokenizer: null  # Will be set from model
-  # TODO: Update these paths to your actual data location
-  train_files: ~/data/proactive_dataset/train.parquet
-  val_files: ~/data/proactive_dataset/test.parquet  # Optional: create if you have validation data
+  # Processed sampleQA data paths
+  train_files: data/processed_sampleQA/train.parquet
+  val_files: data/processed_sampleQA/test.parquet
   train_max_samples: -1  # -1 to use full dataset
   val_max_samples: -1
   prompt_key: prompt
