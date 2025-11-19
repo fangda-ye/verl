@@ -7,6 +7,7 @@ tailored for proactive agents that use <think> and <proactive> tags.
 """
 
 import re
+from difflib import SequenceMatcher
 import numpy as np
 
 
@@ -37,6 +38,109 @@ def extract_formal_answer(response: str) -> str:
     return formal_answer.strip()
 
 
+def extract_proactive_content(response: str) -> str:
+    """
+    Extract the content inside <proactive>...</proactive> tags.
+
+    Args:
+        response: The full response string
+
+    Returns:
+        The proactive content (empty string if no proactive tag or empty content)
+    """
+    match = re.search(r'<proactive>(.*?)</proactive>', response, re.DOTALL | re.IGNORECASE)
+    if match:
+        content = match.group(1).strip()
+        return content
+    return ""
+
+
+def normalize_text(text: str) -> str:
+    """
+    Normalize text for better matching.
+    - Convert to lowercase
+    - Remove extra whitespace
+    - Remove common punctuation
+    """
+    # Lowercase
+    text = text.lower()
+    # Remove punctuation (keep alphanumeric and spaces)
+    text = re.sub(r'[^\w\s]', ' ', text)
+    # Normalize whitespace
+    text = ' '.join(text.split())
+    return text
+
+
+def fuzzy_match(text: str, target: str, threshold: float = 0.6) -> bool:
+    """
+    Check if target appears in text with fuzzy matching.
+
+    Args:
+        text: The text to search in
+        target: The target string to find
+        threshold: Similarity threshold (0.0 to 1.0)
+
+    Returns:
+        True if target is found in text with similarity >= threshold
+    """
+    text_norm = normalize_text(text)
+    target_norm = normalize_text(target)
+
+    # Exact match after normalization
+    if target_norm in text_norm:
+        return True
+
+    # Fuzzy match - check if any substring has high similarity
+    target_len = len(target_norm)
+    if target_len == 0:
+        return False
+
+    # Sliding window fuzzy match
+    for i in range(len(text_norm) - target_len + 1):
+        substring = text_norm[i:i + target_len]
+        similarity = SequenceMatcher(None, substring, target_norm).ratio()
+        if similarity >= threshold:
+            return True
+
+    # Also check overall similarity for short targets
+    if len(target_norm.split()) <= 3:
+        similarity = SequenceMatcher(None, text_norm, target_norm).ratio()
+        if similarity >= threshold:
+            return True
+
+    return False
+
+
+def check_correctness(formal_answer: str, ground_truth: str) -> bool:
+    """
+    Check if the formal answer is correct using multiple matching strategies.
+
+    Args:
+        formal_answer: The extracted formal answer
+        ground_truth: The ground truth answer
+
+    Returns:
+        True if the answer is considered correct
+    """
+    # Strategy 1: Exact substring match (normalized)
+    if normalize_text(ground_truth) in normalize_text(formal_answer):
+        return True
+
+    # Strategy 2: Fuzzy match with 80% threshold
+    if fuzzy_match(formal_answer, ground_truth, threshold=0.8):
+        return True
+
+    # Strategy 3: For numeric answers, extract and compare numbers
+    gt_numbers = re.findall(r'\d+\.?\d*', ground_truth)
+    answer_numbers = re.findall(r'\d+\.?\d*', formal_answer)
+    if gt_numbers and answer_numbers:
+        # Check if all GT numbers appear in the answer
+        if all(num in answer_numbers for num in gt_numbers):
+            return True
+
+    return False
+
+
 def proactive_group_aware_reward(
     prompt_str: str,
     responses: list[str],
@@ -44,16 +148,25 @@ def proactive_group_aware_reward(
     data_sources: list[str],
     extra_infos: list[dict],
     beta: float = 0.8,
+    min_proactive_length: int = 10,
     **kwargs,
 ) -> list[float]:
     """
     Proactive group-aware reward function with improved correctness checking.
 
     Scoring rules:
-    1. Correctness: +1 if ground truth in FORMAL ANSWER (excluding <think> and <proactive>), else 0
-    2. Format bonus: +0.05 for <think>, +0.05 for <proactive>
-    3. Proactive content: If has proactive content, score = beta * (1 - group_acc)
-    4. Final: correctness + format_bonus OR proactive_score (whichever applies)
+    1. If <proactive> has substantial content (>= min_proactive_length chars):
+       - This is a "don't know" answer
+       - Reward = beta * (1 - group_acc) + format_bonus
+       - Do NOT check correctness (we assume proactive means uncertain)
+
+    2. If NO substantial <proactive> content:
+       - Check correctness using improved matching
+       - Reward = correctness + format_bonus
+
+    Format bonuses:
+    - +0.05 for <think> tag
+    - +0.05 for <proactive> tag (only if it has content)
 
     Args:
         prompt_str: The prompt string (same for all responses in the group)
@@ -62,47 +175,66 @@ def proactive_group_aware_reward(
         data_sources: List of data sources
         extra_infos: List of extra information dicts
         beta: Weight for proactive scoring (default: 0.8)
+        min_proactive_length: Minimum chars in proactive to count as substantial (default: 10)
 
     Returns:
         List of reward scores, one per response
     """
 
-    # Step 1: Compute correctness for each response
-    # IMPORTANT: Only check correctness in the formal answer part
+    # Step 1: First pass - compute correctness for responses WITHOUT substantial proactive content
     correctness_scores = []
+    has_substantial_proactive = []
+
     for response, gt in zip(responses, ground_truths):
-        # Extract formal answer (remove think and proactive tags)
-        formal_answer = extract_formal_answer(response)
+        # Extract proactive content
+        proactive_content = extract_proactive_content(response)
+        has_proactive = len(proactive_content) >= min_proactive_length
 
-        # Check if ground truth is in the formal answer
-        is_correct = gt.strip().lower() in formal_answer.strip().lower()
-        correctness_scores.append(1.0 if is_correct else 0.0)
+        has_substantial_proactive.append(has_proactive)
 
-    # Step 2: Compute group accuracy based on formal answers
-    group_acc = sum(correctness_scores) / len(correctness_scores) if correctness_scores else 0.0
+        if has_proactive:
+            # Proactive response - don't compute correctness
+            correctness_scores.append(0.0)  # Placeholder, won't be used
+        else:
+            # Regular response - check correctness
+            formal_answer = extract_formal_answer(response)
+            is_correct = check_correctness(formal_answer, gt)
+            correctness_scores.append(1.0 if is_correct else 0.0)
+
+    # Step 2: Compute group accuracy (only from non-proactive responses)
+    non_proactive_correctness = [
+        score for score, has_pro in zip(correctness_scores, has_substantial_proactive)
+        if not has_pro
+    ]
+    if non_proactive_correctness:
+        group_acc = sum(non_proactive_correctness) / len(non_proactive_correctness)
+    else:
+        # All responses are proactive - set group_acc to 0 (hardest)
+        group_acc = 0.0
 
     # Step 3: Compute rewards for each response
     rewards = []
-    for response, correctness in zip(responses, correctness_scores):
-        reward = 0.0
-
-        # Check format bonuses (check in full response)
+    for i, (response, correctness, has_proactive) in enumerate(
+        zip(responses, correctness_scores, has_substantial_proactive)
+    ):
+        # Check format tags
         has_think = bool(re.search(r'<think>.*?</think>', response, re.DOTALL | re.IGNORECASE))
-        has_proactive = bool(re.search(r'<proactive>.*?</proactive>', response, re.DOTALL | re.IGNORECASE))
+        proactive_content = extract_proactive_content(response)
 
+        # Format bonuses
         format_bonus = 0.0
         if has_think:
             format_bonus += 0.05
-        if has_proactive:
+        if len(proactive_content) >= min_proactive_length:
             format_bonus += 0.05
 
-        # If has proactive content, use proactive scoring
+        # Compute reward based on response type
         if has_proactive:
-            # Proactive responses get rewarded based on group difficulty
+            # Proactive response: reward based on group difficulty
             # Harder problems (low group_acc) get higher rewards
             reward = beta * (1 - group_acc) + format_bonus
         else:
-            # Regular scoring: correctness + format bonus
+            # Regular response: reward based on correctness
             reward = correctness + format_bonus
 
         rewards.append(reward)
@@ -117,6 +249,7 @@ def proactive_group_aware_reward_detailed(
     data_sources: list[str],
     extra_infos: list[dict],
     beta: float = 0.8,
+    min_proactive_length: int = 10,
     think_bonus: float = 0.05,
     proactive_bonus: float = 0.05,
     **kwargs,
@@ -127,55 +260,80 @@ def proactive_group_aware_reward_detailed(
     Returns a list of dicts with detailed scoring information.
     """
 
-    # Step 1: Compute correctness for each response
+    # Step 1: Compute correctness
     correctness_scores = []
+    has_substantial_proactive = []
     formal_answers = []
+    proactive_contents = []
 
     for response, gt in zip(responses, ground_truths):
+        # Extract proactive content
+        proactive_content = extract_proactive_content(response)
+        proactive_contents.append(proactive_content)
+        has_proactive = len(proactive_content) >= min_proactive_length
+        has_substantial_proactive.append(has_proactive)
+
         # Extract formal answer
         formal_answer = extract_formal_answer(response)
         formal_answers.append(formal_answer)
 
-        # Check correctness in formal answer only
-        is_correct = gt.strip().lower() in formal_answer.strip().lower()
-        correctness_scores.append(1.0 if is_correct else 0.0)
+        if has_proactive:
+            correctness_scores.append(0.0)
+        else:
+            is_correct = check_correctness(formal_answer, gt)
+            correctness_scores.append(1.0 if is_correct else 0.0)
 
     # Step 2: Compute group accuracy
-    group_acc = sum(correctness_scores) / len(correctness_scores) if correctness_scores else 0.0
+    non_proactive_correctness = [
+        score for score, has_pro in zip(correctness_scores, has_substantial_proactive)
+        if not has_pro
+    ]
+    if non_proactive_correctness:
+        group_acc = sum(non_proactive_correctness) / len(non_proactive_correctness)
+    else:
+        group_acc = 0.0
 
     # Step 3: Compute detailed rewards
     results = []
-    for i, (response, correctness) in enumerate(zip(responses, correctness_scores)):
+    for i, (response, correctness, has_proactive) in enumerate(
+        zip(responses, correctness_scores, has_substantial_proactive)
+    ):
         # Check format
         has_think = bool(re.search(r'<think>.*?</think>', response, re.DOTALL | re.IGNORECASE))
-        has_proactive = bool(re.search(r'<proactive>.*?</proactive>', response, re.DOTALL | re.IGNORECASE))
+        proactive_content = proactive_contents[i]
 
         format_bonus = 0.0
         if has_think:
             format_bonus += think_bonus
-        if has_proactive:
+        if len(proactive_content) >= min_proactive_length:
             format_bonus += proactive_bonus
 
         # Compute final reward
         if has_proactive:
             base_reward = beta * (1 - group_acc)
             reward = base_reward + format_bonus
+            reward_type = "proactive"
         else:
             reward = correctness + format_bonus
+            reward_type = "correctness"
 
         results.append({
             "score": reward,
+            "reward_type": reward_type,
             "correctness": correctness,
             "has_think": has_think,
-            "has_proactive": has_proactive,
+            "has_substantial_proactive": has_proactive,
+            "proactive_content_length": len(proactive_content),
             "format_bonus": format_bonus,
             "group_acc": group_acc,
             "formal_answer": formal_answers[i][:100],  # First 100 chars for debugging
+            "proactive_preview": proactive_content[:100] if proactive_content else "",
         })
 
     return results
 
 
+# Keep other reward functions for compatibility
 def simple_group_aware_reward(
     prompt_str: str,
     responses: list[str],
@@ -184,35 +342,13 @@ def simple_group_aware_reward(
     extra_infos: list[dict],
     **kwargs,
 ) -> list[float]:
-    """
-    Simple example: Compute basic correctness for each response, but the reward
-    function has access to all responses in the group.
-
-    This is a minimal example to show the interface. You could extend this to
-    implement more sophisticated adaptive scoring strategies.
-
-    Args:
-        prompt_str: The prompt string (same for all responses in the group)
-        responses: List of all response strings for this prompt
-        ground_truths: List of ground truth answers (usually the same for all)
-        data_sources: List of data sources (usually the same for all)
-        extra_infos: List of extra information dicts
-
-    Returns:
-        List of reward scores, one per response
-    """
+    """Simple example with improved matching."""
     scores = []
     for i, response in enumerate(responses):
         ground_truth = ground_truths[i]
-        # Extract formal answer before checking
         formal_answer = extract_formal_answer(response)
-        # Simple exact match (you would use more sophisticated logic here)
-        if ground_truth.strip().lower() in formal_answer.strip().lower():
-            score = 1.0
-        else:
-            score = 0.0
-        scores.append(score)
-
+        is_correct = check_correctness(formal_answer, ground_truth)
+        scores.append(1.0 if is_correct else 0.0)
     return scores
 
 
@@ -224,41 +360,17 @@ def adaptive_difficulty_reward(
     extra_infos: list[dict],
     **kwargs,
 ) -> list[float]:
-    """
-    Adaptive reward based on group difficulty.
-
-    If most responses in the group are correct, the problem is considered easier,
-    and correct responses get lower rewards. If most are incorrect, correct responses
-    get higher rewards (harder problem).
-
-    This implements a simple form of adaptive difficulty scoring.
-
-    Args:
-        prompt_str: The prompt string
-        responses: List of all response strings for this prompt
-        ground_truths: List of ground truth answers
-        data_sources: List of data sources
-        extra_infos: List of extra information dicts
-
-    Returns:
-        List of adaptive reward scores
-    """
-    # First, compute binary correctness for all responses
+    """Adaptive reward with improved matching."""
     is_correct = []
     for i, response in enumerate(responses):
         ground_truth = ground_truths[i]
         formal_answer = extract_formal_answer(response)
-        correct = ground_truth.strip().lower() in formal_answer.strip().lower()
+        correct = check_correctness(formal_answer, ground_truth)
         is_correct.append(correct)
 
-    # Compute group success rate (difficulty measure)
     success_rate = sum(is_correct) / len(is_correct) if is_correct else 0.5
-
-    # Adaptive reward: harder problems (lower success rate) get higher rewards
-    # Difficulty bonus ranges from 0.5 to 1.5
     difficulty_multiplier = 2.0 - success_rate
 
-    # Compute final scores
     scores = []
     for correct in is_correct:
         base_score = 1.0 if correct else 0.0
@@ -266,194 +378,3 @@ def adaptive_difficulty_reward(
         scores.append(adaptive_score)
 
     return scores
-
-
-def relative_quality_reward(
-    prompt_str: str,
-    responses: list[str],
-    ground_truths: list[str],
-    data_sources: list[str],
-    extra_infos: list[dict],
-    **kwargs,
-) -> list[dict]:
-    """
-    Reward based on relative quality within the group.
-
-    This example computes a quality score for each response (e.g., based on length,
-    correctness, etc.), then assigns rewards based on the relative ranking within
-    the group. This encourages diversity and competition among responses.
-
-    Args:
-        prompt_str: The prompt string
-        responses: List of all response strings for this prompt
-        ground_truths: List of ground truth answers
-        data_sources: List of data sources
-        extra_infos: List of extra information dicts
-
-    Returns:
-        List of dicts with 'score' and additional metadata
-    """
-    # Compute quality scores (this is a simplified example)
-    quality_scores = []
-    for i, response in enumerate(responses):
-        ground_truth = ground_truths[i]
-        formal_answer = extract_formal_answer(response)
-
-        # Example quality metrics
-        has_answer = ground_truth.strip().lower() in formal_answer.strip().lower()
-        length_score = min(len(formal_answer) / 100.0, 1.0)  # Normalize length
-        quality = (1.0 if has_answer else 0.0) + length_score * 0.2
-
-        quality_scores.append(quality)
-
-    # Compute mean and std of quality scores in this group
-    mean_quality = np.mean(quality_scores)
-    std_quality = np.std(quality_scores) if len(quality_scores) > 1 else 1.0
-
-    # Assign rewards based on relative performance
-    results = []
-    for i, quality in enumerate(quality_scores):
-        # Normalize by group statistics
-        if std_quality > 0:
-            normalized_score = (quality - mean_quality) / std_quality
-        else:
-            normalized_score = 0.0
-
-        # Convert to reward (you can adjust the scaling)
-        reward = normalized_score
-
-        results.append(
-            {
-                "score": reward,
-                "quality_score": quality,
-                "group_mean_quality": mean_quality,
-                "group_std_quality": std_quality,
-            }
-        )
-
-    return results
-
-
-def best_of_n_reward(
-    prompt_str: str,
-    responses: list[str],
-    ground_truths: list[str],
-    data_sources: list[str],
-    extra_infos: list[dict],
-    **kwargs,
-) -> list[float]:
-    """
-    Best-of-N style reward: Only the best response(s) in the group get positive reward.
-
-    This implements a winner-takes-all or winner-takes-most strategy where only
-    the top-performing responses get rewards, encouraging the model to produce
-    at least one high-quality response per prompt.
-
-    Args:
-        prompt_str: The prompt string
-        responses: List of all response strings for this prompt
-        ground_truths: List of ground truth answers
-        data_sources: List of data sources
-        extra_infos: List of extra information dicts
-
-    Returns:
-        List of reward scores (only top responses get positive rewards)
-    """
-    # Compute quality for each response
-    qualities = []
-    for i, response in enumerate(responses):
-        ground_truth = ground_truths[i]
-        formal_answer = extract_formal_answer(response)
-
-        # Example quality metric (replace with your own)
-        has_answer = ground_truth.strip().lower() in formal_answer.strip().lower()
-        quality = 1.0 if has_answer else 0.0
-
-        qualities.append(quality)
-
-    # Find the maximum quality in the group
-    max_quality = max(qualities) if qualities else 0.0
-
-    # Only reward responses that match the best quality
-    # (you could also reward top-k instead)
-    scores = []
-    for quality in qualities:
-        if quality == max_quality and max_quality > 0:
-            # Winner gets reward
-            score = 1.0
-        else:
-            # Losers get no reward (or small penalty)
-            score = 0.0
-
-        scores.append(score)
-
-    return scores
-
-
-def pass_at_k_reward(
-    prompt_str: str,
-    responses: list[str],
-    ground_truths: list[str],
-    data_sources: list[str],
-    extra_infos: list[dict],
-    k: int = 1,
-    **kwargs,
-) -> list[dict]:
-    """
-    Pass@k style reward for code generation or similar tasks.
-
-    Rewards all responses in the group based on whether at least k responses
-    in the group are correct. This encourages the model to generate multiple
-    correct solutions.
-
-    Args:
-        prompt_str: The prompt string
-        responses: List of all response strings for this prompt
-        ground_truths: List of ground truth answers
-        data_sources: List of data sources
-        extra_infos: List of extra information dicts
-        k: Minimum number of correct responses needed for the group to succeed
-
-    Returns:
-        List of dicts with rewards and metadata
-    """
-    # Compute correctness for each response
-    is_correct = []
-    for i, response in enumerate(responses):
-        ground_truth = ground_truths[i]
-        formal_answer = extract_formal_answer(response)
-        # Replace with actual test execution for code
-        correct = ground_truth.strip().lower() in formal_answer.strip().lower()
-        is_correct.append(correct)
-
-    # Count number of correct responses
-    num_correct = sum(is_correct)
-    group_passes = num_correct >= k
-
-    # Assign rewards
-    results = []
-    for i, correct in enumerate(is_correct):
-        if group_passes:
-            # Group passed: reward correct responses more
-            reward = 1.0 if correct else -0.1
-        else:
-            # Group failed: smaller rewards
-            reward = 0.5 if correct else -0.2
-
-        results.append(
-            {
-                "score": reward,
-                "is_correct": correct,
-                "num_correct_in_group": num_correct,
-                "group_passes": group_passes,
-            }
-        )
-
-    return results
-
-
-# You can add more sophisticated reward functions here, such as:
-# - Diversity-aware rewards (penalize similar responses)
-# - Curriculum learning rewards (adapt based on training progress)
-# - Multi-objective rewards (combining multiple metrics)
-# - Uncertainty-based rewards (using model confidence)
